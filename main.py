@@ -67,6 +67,17 @@ def main():
         if is_anomaly:
             records[i].mark_as_anomaly()
 
+    # Detector accuracy evaluate karo
+    df_sample = df_sample.copy()
+    df_sample['predicted_anomaly'] = stat_results
+    df_sample['actual_is_attack'] = df_sample['label'] != 'normal'
+
+    correct = (df_sample['predicted_anomaly'] == df_sample['actual_is_attack']).sum()
+    accuracy = correct / len(df_sample) * 100
+    print(f"Statistical Detector Accuracy: {accuracy:.2f}%")
+
+   
+
     # Step 5: Save to database
     for record in records:
         conn_repo.insert_connection(record)
