@@ -1,14 +1,16 @@
 from dotenv import load_dotenv
 import os
+import numpy as np
+
 
 from database.db_connection import DatabaseConnection
 from repository.connection_repository import ConnectionRepository
 from repository.alert_repository import AlertRepository
 from models.connection_record import ConnectionRecord
-from models.statistical_detector import StatisticalAnomalyDetector
 from models.rule_based_detector import RuleBasedDetector
 from utils.data_loader import load_csv_data, clean_data
 from visualization.charts import plot_attack_distribution, plot_detector_comparison
+from sklearn.ensemble import IsolationForest
 
 load_dotenv()
 
@@ -25,14 +27,32 @@ columns = [
     "dst_host_rerror_rate", "dst_host_srv_rerror_rate", "label", "difficulty"
 ]
 
+
+def detect_anomalies(df, features, threshold=2.0):
+    """
+    Multiple features ka combined anomaly score nikalta hai.
+    Jitna zyada features 'unusual' honge, utna zyada score hoga.
+    """
+    total_score = np.zeros(len(df))
+    for feature in features:
+        mean = df[feature].mean()
+        std = df[feature].std()
+        if std > 0:
+            z_score = np.abs((df[feature] - mean) / std)
+            total_score += z_score
+    return total_score > threshold
+
+
 def main():
-    # Step 1: Load & clean data
+    # ---------------- Step 1: Data Load & Clean ----------------
     df = load_csv_data("data/KDDTrain+.txt", columns)
     df = clean_data(df)
-    df_sample = df.head(500)   # test ke liye chhota sample
+    df_sample = df.head(500).copy()
     print(f"Loaded {len(df_sample)} records")
 
-    # Step 2: Database connect
+    df_sample['actual_is_attack'] = df_sample['label'] != 'normal'
+
+    # ---------------- Step 2: Database Connect ----------------
     db = DatabaseConnection(
         host=os.getenv("DB_HOST"),
         user=os.getenv("DB_USER"),
@@ -42,9 +62,8 @@ def main():
     db.connect()
 
     conn_repo = ConnectionRepository(db)
-    alert_repo = AlertRepository(db)
 
-    # Step 3: Convert rows to ConnectionRecord objects
+    # ---------------- Step 3: Convert Rows to ConnectionRecord Objects ----------------
     records = []
     for _, row in df_sample.iterrows():
         record = ConnectionRecord(
@@ -55,43 +74,62 @@ def main():
         )
         records.append(record)
 
-    # Step 4: Run detectors
-    stat_detector = StatisticalAnomalyDetector(threshold=3)
-    rule_detector = RuleBasedDetector(byte_threshold=5000, duration_threshold=100)
+    # ---------------- Step 4: Statistical Detector (Meaningful Features) ----------------
+    # 'count' aur 'serror_rate' DoS/Probe attacks ke liye achhe indicators hote hain
+    features_used = ['count', 'srv_count', 'serror_rate', 'dst_host_serror_rate']
+    stat_predictions = detect_anomalies(df_sample, features_used, threshold=2.0)
 
-    src_bytes_data = df_sample["src_bytes"].values
-    stat_results = stat_detector.detect(src_bytes_data)
+    correct_stat = (stat_predictions == df_sample['actual_is_attack'].values).sum()
+    stat_accuracy = correct_stat / len(df_sample) * 100
+    print(f"Statistical Detector Accuracy: {stat_accuracy:.2f}%")
+
+    # ---------------- Step 5: Rule-Based Detector ----------------
+    rule_detector = RuleBasedDetector(byte_threshold=5000, duration_threshold=100)
     rule_results = rule_detector.detect(records)
 
-    for i, is_anomaly in enumerate(stat_results):
+    correct_rule = (np.array(rule_results) == df_sample['actual_is_attack'].values).sum()
+    rule_accuracy = correct_rule / len(df_sample) * 100
+    print(f"Rule-Based Detector Accuracy: {rule_accuracy:.2f}%")
+
+    # ---------------- Step 6: Mark Records (Statistical Detector Ke Results Se) ----------------
+    for i, is_anomaly in enumerate(stat_predictions):
         if is_anomaly:
             records[i].mark_as_anomaly()
 
-    # Detector accuracy evaluate karo
-    df_sample = df_sample.copy()
-    df_sample['predicted_anomaly'] = stat_results
-    df_sample['actual_is_attack'] = df_sample['label'] != 'normal'
 
-    correct = (df_sample['predicted_anomaly'] == df_sample['actual_is_attack']).sum()
-    accuracy = correct / len(df_sample) * 100
-    print(f"Statistical Detector Accuracy: {accuracy:.2f}%")
+        # ---------------- ML-Based Detector (Isolation Forest) ----------------
+    ml_features = df_sample[['count', 'srv_count', 'serror_rate', 
+                               'dst_host_serror_rate', 'src_bytes', 'dst_bytes', 'duration']]
+    
+    iso_forest = IsolationForest(contamination=0.47, random_state=42)
+    ml_predictions = iso_forest.fit_predict(ml_features) == -1   # -1 means anomaly in sklearn
 
-   
+    correct_ml = (ml_predictions == df_sample['actual_is_attack'].values).sum()
+    ml_accuracy = correct_ml / len(df_sample) * 100
+    print(f"ML (Isolation Forest) Accuracy: {ml_accuracy:.2f}%")
 
-    # Step 5: Save to database
+    # ---------------- Step 7: Save to Database ----------------
     for record in records:
         conn_repo.insert_connection(record)
+    print(f"{len(records)} records saved to database.")
 
-    # Step 6: Analysis + Visualization
+    # ---------------- Step 8: Visualization ----------------
     attack_summary = df_sample["label"].value_counts().to_dict()
     plot_attack_distribution(attack_summary)
 
-    comparison = [stat_detector.get_summary(), rule_detector.get_summary()]
-    for c in comparison:
-        c["anomaly_rate_percent"] = round((c["total_anomalies"] / c["total_checked"]) * 100, 2)
+    comparison = [
+          {"detector_name": "Statistical Detector", "total_checked": len(df_sample),
+         "total_anomalies": int(np.sum(stat_predictions)), "anomaly_rate_percent": round(stat_accuracy, 2)},
+        {"detector_name": "Rule-Based Detector", "total_checked": len(df_sample),
+         "total_anomalies": sum(rule_results), "anomaly_rate_percent": round(rule_accuracy, 2)},
+        {"detector_name": "ML (Isolation Forest)", "total_checked": len(df_sample),
+         "total_anomalies": int(np.sum(ml_predictions)), "anomaly_rate_percent": round(ml_accuracy, 2)},
+    ]
     plot_detector_comparison(comparison)
+    
 
     db.close()
+
 
 if __name__ == "__main__":
     main()

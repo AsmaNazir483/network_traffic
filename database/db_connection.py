@@ -1,6 +1,7 @@
 import mysql.connector
 from mysql.connector import Error
 
+
 class DatabaseConnection:
     """MySQL se connect karne wali class"""
 
@@ -19,10 +20,13 @@ class DatabaseConnection:
                 password=self.password,
                 database=self.database
             )
+
             if self.connection.is_connected():
                 print("✅ Database connected successfully!")
+
         except Error as e:
             print(f"❌ Database connection failed: {e}")
+            self.connection = None
 
     def get_connection(self):
         return self.connection
